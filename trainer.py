@@ -106,12 +106,14 @@ class trainer:
         self.logger = logger
         logger.info(args)
 
-    # ===================== 钩子：在 o_proj 输入处捕获每个 head 的原始子向量 =====================
+   # ===================== 钩子：在 o_proj 输入处捕获每个 head 的原始子向量 =====================
     def _capture_head_inputs_llava(self, layer_idx, module, args, kwargs=None):
         """
         hook o_proj 的 forward_pre_hook：args[0] 形如 [B, T, num_heads*head_dim]，
         即所有 head 拼接后、W_O 投影前的张量。
-        论文公式(6)(7)需要 a~_{h,-1}^l = a_{h,-1}^l W_O，这里直接算出并缓存。
+        论文公式(6)(7)需要 a~_{h,-1}^l = a_{h,-1}^l W_O。
+        注意：调用方需保证本次前向的最后一个 token 就是目标名词 token，
+        这样 [:,-1,:] 才与 Q 的 noun_pos 对齐。
         """
         if not args:
             return
@@ -121,7 +123,6 @@ class trainer:
 
         attn_module = self.model.model.layers[layer_idx].self_attn
         num_heads = attn_module.num_heads
-        # 兼容不同 transformers 版本
         head_dim = getattr(attn_module, 'head_dim', None)
         if head_dim is None:
             head_dim = attn_module.hidden_size // num_heads
@@ -130,25 +131,22 @@ class trainer:
         if H != num_heads * head_dim:
             return
 
-        # 拆出每个 head 在最后一个 token 的原始子向量 a_{h,-1}^l: [B, Nh, Dh]
-        last_tok = attn_concat[:, -1, :].view(B, num_heads, head_dim)
+        # 取最后一个 token（调用方保证它是目标名词 token）
+        last_tok = attn_concat[:, -1, :].view(B, num_heads, head_dim)   # [B, Nh, Dh]
 
         # W_O = o_proj.weight: [H_out, num_heads*head_dim]
-        for h in range(num_heads):
-		    a_h = last_tok[:, h, :]  # [B, D]
-		
-		    # 当前 head 对应的 W_O 权重块：[H, D]
-		    W_O_h = W_O_heads[:, h, :]
-		
-		    # 单头输出投影到完整 hidden dimension：[B, H]
-		    a_h_proj = torch.einsum('bd,od->bo', a_h, W_O_h)
-		
-		    key = (layer_idx, h)
-		    self.head_outputs.setdefault(key, []).append(
-		        a_h_proj.detach().cpu()
-	     )
+        W_O = attn_module.o_proj.weight.detach()                        # [H, Nh*Dh]
+        W_O_heads = W_O.view(W_O.shape[0], num_heads, head_dim)         # [H, Nh, Dh]
 
-    # ===================== 注意力头重要性：论文公式(6) 归一化 L2 =====================
+        for h in range(num_heads):
+            a_h = last_tok[:, h, :]                                     # [B, Dh]
+            W_O_h = W_O_heads[:, h, :]                                  # [H, Dh]
+            # a~_h = a_h @ W_O_h^T  -> [B, H]
+            a_h_proj = torch.einsum('bd,od->bo', a_h, W_O_h)
+            key = (layer_idx, h)
+            self.head_outputs.setdefault(key, []).append(a_h_proj.detach().cpu())
+
+   # ===================== 注意力头重要性：论文公式(6) 归一化 L2 =====================
     def compute_head_importance(self):
         if not self.head_outputs:
             return {}
@@ -701,10 +699,15 @@ class trainer:
                         )
                         hooks.append(h)
 
-                # 前向传播（只需要得到当前名词时刻的注意力）
+                # ===== 关键修改：第二次前向喂 “prompt + 生成到名词 token 的前缀” =====
+                # 使本次前向的最后一个 token 就是目标名词 token，
+                # hook 里的 [:,-1,:] 与 Q 的 noun_pos 对齐，满足论文式(6)-(9)同位置假设。
+                gen_prefix = output_ids[:, input_token_len:input_token_len + pos + 1]
+                prefix_ids = torch.cat([self.input_ids, gen_prefix], dim=1)
+
                 with torch.no_grad():
                     _ = self.model(
-                        self.input_ids,
+                        prefix_ids,
                         images=image_tensor.unsqueeze(0).half().cuda(),
                         return_dict=True
                     )
