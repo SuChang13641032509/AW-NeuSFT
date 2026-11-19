@@ -134,15 +134,19 @@ class trainer:
         last_tok = attn_concat[:, -1, :].view(B, num_heads, head_dim)
 
         # W_O = o_proj.weight: [H_out, num_heads*head_dim]
-        W_O = attn_module.o_proj.weight.detach()                      # [H, Nh*Dh]
-        W_O_heads = W_O.view(W_O.shape[0], num_heads, head_dim)       # [H, Nh, Dh]
-
         for h in range(num_heads):
-            a_h = last_tok[:, h, :]                                   # [B, Dh]
-            # a~_h = a_h @ W_O^(h)  ->  [B, H]
-            a_h_proj = torch.einsum('bd,hnd->bhn', a_h, W_O_heads)[:, h, :]
-            key = (layer_idx, h)
-            self.head_outputs.setdefault(key, []).append(a_h_proj.detach().cpu())
+		    a_h = last_tok[:, h, :]  # [B, D]
+		
+		    # 当前 head 对应的 W_O 权重块：[H, D]
+		    W_O_h = W_O_heads[:, h, :]
+		
+		    # 单头输出投影到完整 hidden dimension：[B, H]
+		    a_h_proj = torch.einsum('bd,od->bo', a_h, W_O_h)
+		
+		    key = (layer_idx, h)
+		    self.head_outputs.setdefault(key, []).append(
+		        a_h_proj.detach().cpu()
+	     )
 
     # ===================== 注意力头重要性：论文公式(6) 归一化 L2 =====================
     def compute_head_importance(self):
